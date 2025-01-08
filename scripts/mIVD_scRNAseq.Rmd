@@ -1,0 +1,704 @@
+---
+title: "mIVD_scRNAseq"
+author: "Jian"
+date: '2024-12-25'
+output: html_document
+---
+
+# Note: This script include the code used for analyzing single-cell RNAseq of mouse and human discs
+# The input data are accessible at https://data.mendeley.com/datasets/9fxgx59jd7/1
+# For the disc groups, "F" represents type C and "H" represents type A
+
+# 1. Preparations
+## 1.1 prepare the envs and path
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=T, warning=T, cache = FALSE, cache.lazy = FALSE, dev = "png",dpi = 300)
+Sys.setenv(LANGUAGE = "en") 
+options(stringsAsFactors = F, future.fork.enable = TRUE, future.globals.maxSize = 2000 * 1024^1024, 
+        repos = c(CRAN="https://mirrors.tuna.tsinghua.edu.cn/CRAN/"),
+        BioC_mirror="https://mirrors.tuna.tsinghua.edu.cn/bioconductor/")
+```
+
+
+## 1.2 clean the envs and set the data path
+```{r}
+rm(list = ls())
+gc()
+knitr::opts_knit$set(root.dir = "~/project/mouse_IVD/scRNAseq")
+```
+
+# 2. Mouse disc
+```{r}
+# Note: The following steps are used for preprocessing the original count matrix
+```
+## 2.1 load packages
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(pheatmap)
+library(cowplot)
+library(dplyr)
+library(reshape2)
+library(ggpubr)
+library(stringr)
+library(scCustomize)
+```
+
+## 2.2 preprocessing
+### 2.2.1 load matrix
+```{r}
+file_names <- c("IVDH","IVDF")
+
+seu_list <- lapply(file_names, function(x) {
+  count <- Read10X(paste0("./counts/",x,"/filter_matrix/"), gene.column = 1)
+  colnames(count) <- paste0(x, "_", colnames(count))
+  seu_obj <- CreateSeuratObject(counts = count, project = x, min.features = 10)
+  return(seu_obj)
+})
+
+seu <- Merge_Seurat_List(seu_list)
+
+# add the QC information
+seu <- Add_Mito_Ribo_Seurat(seu, species = "mouse")
+seu <- Add_Cell_Complexity_Seurat(seurat_object = seu)
+seu$orig.ident <- factor(seu$orig.ident, levels = c("IVDH","IVDF"))
+saveRDS(seu, file = "./rds/seu_raw.Rds")
+rm(seu_list); gc()
+```
+
+
+### 2.2.2 QC information
+```{r, fig.width=10, fig.height=3.5}
+p1 <- QC_Plots_Genes(seu, low_cutoff = 1000, high_cutoff = 8000, pt.size = 0, group.by = "orig.ident",
+                     colors_use = c('#a5dff9','#FFBC42'), raster = T, plot_median = TRUE)
+p2 <- QC_Plots_UMIs(seu, low_cutoff = 1000, high_cutoff = 50000, pt.size = 0, group.by = "orig.ident",
+                    colors_use = c('#a5dff9','#FFBC42'), raster = T, plot_median = TRUE)
+p3 <- QC_Plots_Mito(seu, high_cutoff = 10, pt.size = 0, group.by = "orig.ident",
+                    colors_use = c('#a5dff9','#FFBC42'), raster = T, plot_median = TRUE)
+p4 <- QC_Plots_Complexity(seu, high_cutoff = 0.8, pt.size = 0, group.by = "orig.ident",
+                          colors_use = c('#a5dff9','#FFBC42'), raster = T, plot_median = TRUE)
+
+p_sample <- wrap_plots(p1, p2, p3, p4, ncol = 4)
+p_sample
+
+ggsave(p_sample, filename = "./pdf/sample_qc.pdf", width = 15, height = 4.5)
+```
+
+### 2.2.3 filter cells/QC
+```{r}
+# criterion: 
+# UMI number > 1000
+# Gene number > 1000
+# Mitochondrial ratio < 10%
+# Potential doublets: removed
+sample_names <- c("IVDH","IVDF")
+library(SCP)
+seu_list <- lapply(sample_names, function(x) {
+  seu_obj <- subset(seu, orig.ident == x)
+  seu_obj <- RunCellQC(seu_obj, return_filtered = F, db_method = "scDblFinder", 
+                       UMI_threshold = 1000, mito_threshold = 10,  
+                       gene_threshold = 1000)
+  return(seu_obj)
+})
+
+seu <- Merge_Seurat_List(seu_list)
+table(seu$CellQC, seu$orig.ident)
+
+seu <- subset(seu, CellQC == "Pass")
+rm(seu_list); gc()
+```
+
+### 2.2.4 batch effect removal
+```{r}
+# using bbknn to remove the technical bias between samples
+library(bbknnR)
+seu <- NormalizeData(seu)
+seu <- FindVariableFeatures(seu)
+seu <- ScaleData(seu)
+seu <- RunPCA(seu, npcs = 50)
+seu_bb <- RunBBKNN(seu, batch_key = "orig.ident", run_UMAP = T, run_TSNE = T)
+DimPlot_scCustom(seu_bb, group.by = c("orig.ident"), reduction = "umap", pt.size = 0.5,
+                       shuffle = T, raster = T, colors_use = c('#a5dff9','#FFBC42'))
+```
+
+### 2.2.5 clustering
+```{r, fig.width=12, fig.height=8}
+# 1. the 1st round of clustering of all cells
+seu_bb <- FindNeighbors(seu_bb, reduction = "pca", k.param = 10)
+seu_bb <- FindClusters(seu_bb, resolution = 0.3, graph.name = "bbknn")
+
+# 2. the 2nd round of clustering of clusters with obvious heterogeneity
+seu_c4 <- subset(seu_bb, seurat_clusters == 4)
+seu_c4 <- FindNeighbors(seu_c4, dims = 1:20, k.param = 10, reduction = "pca")
+seu_c4 <- FindClusters(seu_c4, resolution = 0.1, graph.name = "bbknn")
+seu_bb$sub_cluster <- as.character(seu_bb$seurat_clusters)
+seu_bb$sub_cluster[Cells(seu_c4)] <- paste("c4",Idents(seu_c4), sep = "_")
+
+seu_c6 <- subset(seu_bb, seurat_clusters == 6)
+seu_c6 <- FindNeighbors(seu_c6, dims = 1:20, k.param = 10, reduction = "pca")
+seu_c6 <- FindClusters(seu_c6, resolution = 0.1, graph.name = "bbknn")
+seu_bb$sub_cluster[Cells(seu_c6)] <- paste("c6",Idents(seu_c6), sep = "_")
+
+# 3. final clusters
+DimPlot(seu_bb, group.by = c("sub_cluster"), reduction = "umap", 
+                       shuffle = T, raster = T)
+
+
+# 4. The NP and AF components are distinguished by the curated gene list
+p1 <- Plot_Density_Joint_Only(seu_bb, features = c("T", "Cd24a", "Krt8", "Acan"),
+                        reduction = "umap", pt.size = 0.1) + 
+  scale_color_viridis_c(option = "inferno", direction = -1)
+
+p2 <- Plot_Density_Joint_Only(seu_bb, features = c("Col2a1", "Sox9", "Comp","Bgn"), 
+                        reduction = "umap", pt.size = 0.1)+
+  scale_color_viridis_c(option = "inferno", direction = -1)
+
+p1 /p2
+
+```
+
+### 2.2.6 annotation
+```{r}
+# Note: The cluster annotation should be carefully conducted according to the DEGs and reported marker genes specific to cell types
+Idents(seu_bb) <- "sub_cluster"
+seu_bb <- RenameIdents(object = seu_bb, '0' = 'RegC', '1' = 'HyperC', '2' = "NC", '3' = "FibroC", 
+                       'c4_0' = "CycC", 'c4_1' = "Blood", 'c4_2' = "Blood",'c4_3' = "Blood",
+                       '5' = "OP",'c6_0' = "PC", "c6_1" = "Endothelium")
+seu_bb$cluster <- Idents(seu_bb)
+
+seu_bb$cluster <- factor(seu_bb$cluster, levels = c("NC",'RegC','HyperC',"FibroC", "CycC", "OP","PC",
+                                                    "Endothelium","Blood"))
+
+# set the cluster colors
+cluster_cols <- DiscretePalette_scCustomize(num_colors = 30, palette = "varibow")
+
+
+ph_colors <- list(orig.ident = setNames(c('#a5dff9','#FFBC42'), c("IVDH","IVDF")),
+                  cluster = setNames(cluster_cols[c(1,3,5,9,11,19,26,22,18)], levels(seu_bb$cluster)))
+DimPlot_scCustom(seu_bb, group.by = c("cluster"), reduction = "umap", pt.size = 0.75,
+                       shuffle = T, raster = T, colors_use = ph_colors$cluster, label = T)
+```
+
+
+## 2.3 load the seurat object
+```{r}
+# The processed seurat object can be downloaded and loaded 
+seu_bb <- readRDS("./scRNAseq_seu_object_mDisc.Rds")
+```
+
+## 2.4 DEGs analysis
+```{r}
+# DEGs are calculated and filtered by logFC, pct and adjusted p values
+Idents(seu_bb) <- "cluster"
+allmarkers <- FindAllMarkers(seu_bb, logfc.threshold = 1, min.pct = 0.25, only.pos = T)
+allmarkers_sig <- subset(allmarkers, p_val_adj < 0.01)
+```
+
+
+## 2.5 Deconvolution analysis
+### 2.5.1 scissor
+```{r, fig.width=15, fig.height=10}
+library(preprocessCore)
+library(scAB)
+library(Scissor)
+
+# 1. prepare the bulk RNA-seq data with required format
+meta$time <- 30
+meta$status <- c(rep(1,6), rep(0,6))
+
+meta <- meta[, c("time", "status")]
+rownames(meta) <- 1:12
+
+# 2. perform scissor with one-step
+infos1 <- Scissor(as.matrix(exprs_tpm), seu_bb, meta, alpha = 0.05, 
+                  family = "cox", Save_file = './scissor/cissor_survival.RData')
+
+# 3. add the results to scRNA-seq data
+Scissor_select <- rep(0, ncol(seu_bb))
+names(Scissor_select) <- colnames(seu_bb)
+Scissor_select[infos1$Scissor_pos] <- "Scissor+"
+Scissor_select[infos1$Scissor_neg] <- "Scissor-"
+sc_dataset <- AddMetaData(seu_bb, metadata = Scissor_select, col.name = "scissor")
+
+# 4. visualization
+umap_scissor <- DimPlot(sc_dataset, reduction = 'umap', 
+        group.by = 'scissor',
+        cols = c('grey','royalblue','indianred1'), 
+        pt.size = 1, order = c("Scissor+","Scissor-"), raster = T)
+umap_scissor
+
+# 5. predicted cell types of scRNA-seq enriched in classification of bulk RNA-seq
+scis_cells <- subset(sc_dataset@meta.data, scissor %in% c("Scissor+", "Scissor-"))
+ggdata_count <- as.data.frame(table(scis_cells$cluster, scis_cells$scissor))
+
+ggdata_count$ratio <- ggdata_ratio$Freq
+colnames(ggdata_count) <- c("cluster", "scissor","count","ratio")
+
+p_sci <- ggplot(ggdata_count, aes(reorder(cluster, -count), count, fill = cluster)) + geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(count, "(", round(ratio*100,2), "%)")), 
+             position = position_dodge(0.9), vjust = -0.8) +
+  cowplot::theme_cowplot()+
+  scale_fill_manual(values = ph_colors$cluster) + 
+  facet_wrap(~scissor, nrow = 2,strip.position = "right")
+p_sci
+```
+
+
+### 2.5.2 BayesPrism
+```{r}
+# Using BayesPrism to predict the percentages of cell clusters in each bulk RNA-seq sample
+# Note: This is used to check the consistency between two sequencing methods 
+
+library(BayesPrism)
+
+# 1. prepare the scRNA-seq data
+sc.dat <- GetAssay(seu_bb, assay = "RNA")
+sc.dat <- t(sc.dat@counts)
+sc.dat <- as.matrix(sc.dat)
+cell.type.labels <- as.character(seu_bb$cluster)
+
+sc.stat <- plot.scRNA.outlier(
+  input=sc.dat, 
+  cell.type.labels=cell.type.labels,
+  species="mm", 
+  return.raw=TRUE #return the data used for plotting
+)
+
+## filter the genes that might conribute to the predictive bias
+sc.dat.filtered <- cleanup.genes(input=sc.dat,
+                                 input.type="count.matrix",
+                                 species="mm", 
+                                  gene.group=c("Rb","Mrp","other_Rb","chrM",
+                                               "chrX","chrY","hb","act"),
+                                  exp.cells=5)
+
+# 2. prepare the bulk RNA-seq
+bk.dat <- t(exprs_count)
+
+## test if there is outlier sample in RNA-seq
+bk.stat <- plot.bulk.outlier(
+  bulk.input=bk.dat,
+  sc.input=sc.dat, 
+  cell.type.labels=cell.type.labels,
+  species="mm", 
+  return.raw=TRUE
+  #pdf.prefix="gbm.bk.stat" specify pdf.prefix if need to output to pdf
+)
+bk.stat
+
+
+# 3. perform the analysis
+myPrism <- new.prism(
+  reference=sc.dat.filtered, 
+  mixture=bk.dat,
+  input.type="count.matrix", 
+  cell.type.labels = cell.type.labels, 
+  cell.state.labels = NULL,
+  key=NULL, 
+  outlier.cut=0.01,
+  outlier.fraction=0.1,
+)
+
+
+
+bp.res <- run.prism(prism = myPrism, n.cores=20)
+
+# 4. extract the prediction
+theta_type = get.fraction(bp.res,
+                          which.theta="first", #c("first", "final")
+                          state.or.type="type" #c("state", "type")
+                          )
+
+
+
+# 5. visualization
+meta <- reshape2::colsplit(colnames(exprs_tpm), " ", c(1,2))
+meta <- reshape2::colsplit(meta$`1`, "_", c("sample", "specie", "age"))
+meta$group <- substr(meta$sample, 1, 1)
+meta$rep <- substr(meta$sample, 2, 3)
+rownames(meta) <- meta$sample
+
+df_prop <- as.data.frame(theta_type)
+df_prop$group <- meta$group
+df_prop <- reshape2::melt(df_prop, id = "group")
+colnames(df_prop) <- c("group", "sc_cluster", "prop")
+df_prop$group <- factor(df_prop$group, levels = c("H", "F"))
+
+
+df_prop$sc_cluster <- factor(df_prop$sc_cluster, levels = levels(seu_bb$cluster))
+
+p_bayes <- ggplot(df_prop, aes(x = group, y = prop, fill = group)) +
+  geom_violin(width = 0.8, scale = "width")+
+  stat_boxplot(geom = "boxplot", fill = "white",
+               lwd=0.5,
+               width=0.3)+
+  geom_jitter(aes(y = prop), width = 0.2,size=2, pch=21, color="black", fill = "white")+
+  stat_compare_means(comparisons = list(c("H","F")), method = "t.test", label = "p.format")+
+  cowplot::theme_cowplot()+
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(), )+
+  scale_fill_manual(values = c('#a5dff9','#FFBC42'))+
+  labs(x = "", y = "Predicted percentage") +
+  facet_wrap(~sc_cluster, ncol = 9,strip.position = "bottom")
+
+p_bayes
+```
+
+# 3. Mouse spine
+```{r}
+# Note: The following steps are used for re-analyzing the published scRNA-seq data from spine cells of Shh-Cre;tdTomato mice (10.1096/fj.202301217R)
+# The original fastq files can be downloaded from NCBI
+# Raw reads are mapped to Reference Genome supplemented with tdTomato gene sequence 
+```
+
+## 3.1 load data
+```{r, fig.width=12, fig.width=12}
+file_names <- c("s1", "s2", "s3")
+seu_list <- lapply(file_names, function(x) {
+  count <- Read10X(paste0("./counts/FASEBJ/",x))
+  colnames(count) <- paste0(x, "_", colnames(count))
+  seu_obj <- CreateSeuratObject(counts = count, project = x, min.features = 200, min.cells = 10)
+  seu_obj <- subset(seu_obj, nCount_RNA > 1000)
+  return(seu_obj)
+})
+
+seu_fas <- merge(seu_list[[1]], list(seu_list[[2]], seu_list[[3]]))
+```
+
+## 3.2 preprocessing
+### 3.2.1 QC
+```{r}
+library(scDblFinder)
+library(BiocParallel)
+
+# convert the seurat object into seurat v3 for doublet dectection
+seu_fas_v3 <- seu_fas
+seu_fas_v3[["RNA"]] <- as(seu_fas_v3[["RNA"]], Class="Assay")
+seu_fas_v3 <- as.SingleCellExperiment(seu_fas_v3)
+
+seu_fas_v3 <- scDblFinder(seu_fas_v3, samples="orig.ident", BPPARAM=MulticoreParam(3))
+
+ 
+seu_fas[["percent.mt"]] <- PercentageFeatureSet(object = seu_fas, pattern = "^mt-")
+
+## filter
+seu_fas <- subset(seu_fas, percent.mt < 10)
+seu_fas <- subset(seu_fas, nCount_RNA > 1000)
+```
+
+### 3.2.2 batch effect removal
+```{r}
+# using harmony to remove the technical bias among samples
+library(scCustomize)
+library(harmony)
+seu_fas <- NormalizeData(seu_fas)
+seu_fas <- FindVariableFeatures(seu_fas)
+seu_fas <- ScaleData(seu_fas)
+seu_fas <- RunPCA(seu_fas, npcs = 50)
+
+seu_fas <- RunHarmony(seu_fas,reduction = "pca", group.by.vars = "orig.ident", reduction.save = "harmony")
+seu_fas <- RunUMAP(seu_fas, reduction = "harmony", dims = 1:50, reduction.name = "umap")
+
+
+DimPlot_scCustom(seu_fas, group.by = c("orig.ident"), reduction = "umap", pt.size = 0.5,shuffle = T, raster = T)
+```
+
+
+### 3.2.3 clustering
+```{r}
+seu_fas <- FindNeighbors(seu_fas, reduction = "harmony", k.param = 30, dims = 1:50)
+
+# 1st round of clustering
+seu_fas <- FindClusters(seu_fas, resolution = 0.2,  algorithm = 1)
+
+# 2nd round of clustering
+seu_fas <- FindSubCluster(seu_fas, cluster = "8", resolution = 0.3, subcluster.name = "cluster", graph.name = "RNA_snn")
+
+p1 <- DimPlot_scCustom(seu_fas, group.by = c("cluster"), reduction = "umap", pt.size = 1,
+                       shuffle = T, raster = T, label = T, repel = T)
+
+# Cell clusters relevant to disc and vertebral column
+Idents(seu_fas) <- "cluster"
+p2 <- FeaturePlot_scCustom(seu_fas, feature = c("T", "Col2a1", "Col1a1", "Prrx1"), pt.size = 1, 
+                     na_cutoff = 0.5,reduction = "umap", num_columns = 2, raster = T)
+
+p3 <- Cluster_Highlight_Plot(seu_fas, cluster_name = c("8_0", "8_1", "8_2","8_3", "9", "10", "12"), 
+                             raster = T, pt.size = 1, 
+                             highlight_color = as.character(ph_colors$cluster)[c(2:5, 7,1,6)], reduction ="umap",
+                             background_color = "lightgray")
+p1 | p2 | p3
+```
+
+
+## 3.3 Disc and vertebral column analysis 
+```{r, fig.width=10, fig.height=8}
+seu_fas_disc <- subset(seu_fas, cluster %in% c("8_0", "8_1", "8_2","8_3", "9", "10", "12"))
+
+# 1. dimensional reduction
+eu_fas_disc <- RunUMAP(seu_fas_disc, reduction = "harmony", dims = 1:50, reduction.name = "umap")
+
+DimPlot_scCustom(seu_fas_disc, group.by = c("cluster"), reduction = "umap", pt.size = 2,
+                       shuffle = T, raster = T, label = T, repel = T)
+
+# 2. annotate the cell cluster
+Idents(seu_fas_disc) <- "cluster"
+seu_fas_disc <- RenameIdents(seu_fas_disc, "8_0" = "RegC", "8_1" = "HyperC", "8_2" = "FibroC", 
+                             "8_3" = "PC", "9" = "OB",  "10" = "NC", "12" = "OsteoC")
+seu_fas_disc$disc_cluster <- Idents(seu_fas_disc)
+seu_fas_disc$disc_cluster <- factor(seu_fas_disc$disc_cluster, levels = c("NC", "RegC","HyperC","FibroC", "PC", "OsteoC", "OB"))
+
+
+p1 <- DimPlot_scCustom(seu_fas_disc, group.by = c("disc_cluster"), reduction = "umap", pt.size = 2, colors_use = as.character(ph_colors$cluster),
+                       shuffle = T, raster = T, label = T, repel = T)
+
+
+# 3. marker gene plot
+feature_genes <- c("T","Cd24a","Col2a1","Sox9",
+                   "Cytl1", "Epyc",
+                   "Col1a1","Scx", "Tnc",
+                   "Pdgfra", "Procr", "Prrx1", "Thy1",
+                   "Runx2","Sp7","Alpl")
+p2 <- DotPlot_scCustom(seurat_object = seu_fas_disc, features = feature_genes, flip_axes = F,
+                 remove_axis_titles = T, x_lab_rotate = TRUE) + 
+  scale_y_discrete(limit = rev(levels(seu_fas_disc$disc_cluster)))
+
+# 4. tdTomate expression
+p3 <- FeaturePlot_scCustom(seu_fas_disc, feature = c( "Tdtomato"), pt.size = 2, 
+                     na_cutoff = 3,reduction = "umap", num_columns = 1, raster = T, colors_use = viridis_dark_high)
+
+
+
+p1 | p2 | p3
+```
+
+## 3.4 load the seurat object
+```{r}
+# The processed seurat object can be downloaded and loaded 
+seu_fasebj <- readRDS("./seu_fasebj.Rds")
+```
+
+## 3.5 DEGs
+```{r}
+seu_fas_disc <- JoinLayers(seu_fas_disc)
+
+Idents(seu_fas_disc) <- "disc_cluster"
+degs_fas <- SeuratWrappers::RunPrestoAll(seu_fas_disc, only.pos = T)
+degs_fas <- subset(degs_fas, avg_log2FC > 0.5)
+
+degs_fas_sig <- subset(degs_fas, p_val_adj < 0.05)
+```
+
+
+# 4. human discs
+```{r}
+# Note: The following steps are used for analyzing the scRNA-seq data from human fetal disc (de novo) and postnatal disc (10.1016/j.isci.2023.106692)
+# The published fastq files can be downloaded from NCBI
+```
+
+## 4.1 load data
+```{r}
+## 1. fetal (de novo)
+file_names <- c("IVD1","IVD2")
+seu_list <- lapply(file_names, function(x) {
+  count <- Read10X(paste0("./embryo/rawdata/",x))
+  colnames(count) <- paste0(x, "_", colnames(count))
+  seu_obj <- CreateSeuratObject(counts = count, project = x, min.features = 200, min.cells = 10)
+  seu_obj <- subset(seu_obj, nCount_RNA > 1000)
+  return(seu_obj)
+})
+
+
+## 2. postnatal 
+file_names <- c("C01", "C02", "R01", "R03")
+seu_list1 <- lapply(file_names, function(x) {
+  count <- Read10X(paste0("./scRNA_data_2023_iScience/",x))
+  colnames(count) <- paste0(x, "_", colnames(count))
+  seu_obj <- CreateSeuratObject(counts = count, project = x, min.features = 200, min.cells = 10)
+  seu_obj <- subset(seu_obj, nCount_RNA > 1000)
+  return(seu_obj)
+})
+
+## 3. merge
+seu_hum <- merge(seu_list[[1]], list(seu_list[[2]], seu_list1[[1]],seu_list1[[2]], seu_list1[[3]], seu_list1[[4]]))
+table(seu_hum$orig.ident)
+
+## 4. add the sample information
+seu_hum$group <- seu_hum$orig.ident
+seu_hum$group <- gsub("R01|R03", "Adole", seu_hum$group)
+seu_hum$group <- gsub("C01|C02", "Child", seu_hum$group)
+seu_hum$group <- gsub("IVD1|IVD2", "Embryo", seu_hum$group)
+```
+
+## 4.2 preprocessing
+### 4.2.1 QC
+```{r, fig.width=8, fig.height=4}
+library(scDblFinder)
+library(BiocParallel)
+
+seu_hum_v3 <- seu_hum
+seu_hum_v3[["RNA"]] <- as(seu_hum_v3[["RNA"]], Class="Assay")
+seu_hum_v3 <- as.SingleCellExperiment(seu_hum_v3)
+
+seu_hum_v3 <- scDblFinder(seu_hum_v3, samples="orig.ident", BPPARAM=MulticoreParam(3))
+table(seu_hum_v3$scDblFinder.class, seu_hum_v3$orig.ident)
+ 
+seu_hum$scDblFinder.class <- seu_hum_v3$scDblFinder.class
+
+seu_hum[["percent.mt"]] <- PercentageFeatureSet(object = seu_hum, pattern = "^MT-")
+
+## filter
+seu_hum <- subset(seu_hum, percent.mt < 10)
+seu_hum <- subset(seu_hum, nFeature_RNA > 1000)
+seu_hum <- subset(seu_hum, nCount_RNA > 1000)
+```
+
+### 4.2.2 batch effect removal
+```{r}
+library(scCustomize)
+library(harmony)
+seu_hum <- NormalizeData(seu_hum)
+seu_hum <- FindVariableFeatures(seu_hum)
+seu_hum <- ScaleData(seu_hum)
+seu_hum <- RunPCA(seu_hum, npcs = 50)
+
+seu_hum <- RunHarmony(seu_hum,reduction = "pca", group.by.vars = "orig.ident", reduction.save = "harmony")
+seu_hum <- RunUMAP(seu_hum, reduction = "harmony", dims = 1:50, reduction.name = "umap")
+
+
+DimPlot_scCustom(seu_hum, group.by = c("orig.ident"), reduction = "umap", pt.size = 0.5,shuffle = T, raster = T)
+```
+
+
+### 4.2.3 clustering
+```{r}
+seu_hum <- FindNeighbors(seu_hum, reduction = "harmony", k.param = 30, dims = 1:50)
+seu_hum <- FindClusters(seu_hum, resolution = 0.2,  algorithm = 1)
+
+
+DimPlot(seu_hum, group.by = c("seurat_clusters", "group"), ncol = 2, reduction = "umap", cols = hej_colors, label = T)
+
+seu_hum <- RenameIdents(object = seu_hum, '0' = 'EffectC', '1' = 'HomC', '2' = "CD24_Prog", 
+                         '3' = "HyperC",'4' = "Blood", '5' = "FibroC", "6" = "MKI67_Prog",
+                         "7" = "Epithelium", "8"= "Osteoprogenitor", "9" = "Endothelium", "10" = "MCAM_Prog")
+seu_hum$cluster <- Idents(seu_hum)
+
+seu_hum$cluster <- factor(seu_hum$cluster, levels = c('HomC', "EffectC","FibroC",'HyperC', "Osteoprogenitor",
+                                                      "CD24_Prog","MCAM_Prog", "MKI67_Prog", 
+                                                      "Endothelium","Epithelium", "Blood"))
+
+cluster_cols <- c(louvain_colors[1:3], louvain_colors[5:6], louvain_colors[4], louvain_colors[7:11])
+p1 <- DimPlot(seu_hum, group.by = c("cluster"), ncol = 1, cols = cluster_cols, raster = T,
+              reduction = "umap", label = T)
+
+p2 <- CellStatPlot(srt = seu_hum, stat.by = "cluster", group.by = "group", label = TRUE, palcolor = list(cluster_cols), plot_type = "trend") + coord_flip()
+
+p1 | p2
+
+## marker genes
+feature_genes <- c("DLK1", "COL9A1", "COL2A1", 
+                   "EMP1", "KLF4", "FGF2", "TGFB1",
+                   "COL1A2","COL1A1", "MMP2", "POSTN",
+                   "MATN3", "EPYC","RUNX2", "BGLAP", 
+                   "ALPL", "CDH15", "DLX5", "IBSP", 
+                   "NCAM1", "TBXT", "KRT19", "CD24", 
+                   "RGS5", "MCAM", "ACTA2", "NES", 
+                   "CENPU", "MKI67", "CDK1", 
+                   "EMCN", "PECAM1",
+                   "CNTNAP2","EPCAM",
+                   "PTPRC", "CD68")
+
+DotPlot_scCustom(seurat_object = seu_hum, features = rev(feature_genes), flip_axes = T,
+                 remove_axis_titles = T, x_lab_rotate = T) + 
+  scale_y_discrete(limit = levels(seu_hum$cluster))
+```
+
+## 4.3 load seurat object
+```{r}
+# The processed seurat object can be downloaded and loaded 
+seu_hum <- readRDS("./seu_hum.Rds")
+```
+
+## 4.4 DEGs
+```{r}
+Idents(seu_hum) <- "cluster"
+seu_hum <- JoinLayers(seu_hum)
+allmarkers <- SeuratWrappers::RunPrestoAll(seu_hum, only.pos = T)
+allmarkers <- subset(allmarkers, avg_log2FC > 0.5)
+allmarkers_sig_hum <- subset(allmarkers, p_val_adj < 0.05)
+table(allmarkers_sig_hum$cluster)
+
+degs_rm <- grep("\\.|^LINC", allmarkers_sig_hum$gene, value = T)
+allmarkers_sig_hum <- allmarkers_sig_hum[-grep("\\.|^LINC", allmarkers_sig_hum$gene), ]
+```
+
+
+## 4.5 KNN prediction
+```{r, fig.height=6, fig.width=5}
+# SCP is compatible with seurat v3
+seu_hum_v3 <- seu_hum
+seu_hum_v3[["RNA"]] <- as(seu_hum_v3[["RNA"]], Class="Assay")
+seu_hum3$cluster <- as.character(seu_hum3$cluster)
+seu_hum3$cluster <- gsub("_Prog", "", seu_hum3$cluster)
+
+seu_hum3$cluster <- factor(seu_hum3$cluster, levels = c('HomC', "EffectC","FibroC",'HyperC', "Osteoprogenitor",
+                                                      "CD24","MCAM", "MKI67", 
+                                                      "Endothelium","Blood"))
+
+# perform the prediction
+seu_bb$cluster_group <- paste0(seu_bb$cluster, seu_bb$orig.ident)
+seu_bb$cluster_group <- factor(seu_bb$cluster_group, levels = c(paste0(levels(seu_bb$cluster),  "IVDH"),
+                                                                paste0(levels(seu_bb$cluster),  "IVDF")))
+
+seu_hum3$cluster_group <- paste0(seu_hum3$cluster,  seu_hum3$group)
+seu_hum3$cluster_group <- factor(seu_hum3$cluster_group, levels = c(paste0(levels(seu_hum3$cluster), "Embryo"),
+                                                                    paste0(levels(seu_hum3$cluster), "Child"),
+                                                                    paste0(levels(seu_hum3$cluster),  "Adole")))
+
+seu_obj <- RunKNNPredict(
+    srt_query = seu_hum3, srt_ref = seu_bb,
+    query_group = "cluster_group", ref_group = "cluster_group", filter_lowfreq = 20,
+    return_full_distance_matrix = TRUE
+  )
+  
+DefaultAssay(seu_obj) <- "RNA"
+ht <- CellCorHeatmap(
+    srt_query = seu_obj, srt_ref = seu_bb,
+    query_group = "cluster_group", ref_group = "cluster_group",
+    nlabel = 3, label_by = "row",
+    show_row_names = TRUE, show_column_names = TRUE
+    )
+ht$plot
+```
+
+
+## 4.5 A-C signature score
+```{r}
+# using the signature gene list in murine type A and type C disc to evaluate the human disc at different stages
+
+## 1. homologous gene convert
+disc_type_geneset <- read.csv("disc_type_degs.csv", row.names = 1) # Supplemetary Table 2
+
+library(gprofiler2)
+genes.map <- gorth(rownames(disc_type_geneset), source_organism="mmusculus", target_organism="hsapiens", numeric_ns="ENTREZGENE_ACC")
+disc_type_geneset$orth <- plyr::mapvalues(rownames(disc_type_geneset), genes.map$input, genes.map$ortholog_name)
+
+A_h_gene <- subset(disc_type_geneset, sig == "down")$orth
+C_h_gene<- subset(disc_type_geneset, sig == "up")$orth
+
+
+## 2. Calculate the module score
+seu_hum <- AddModuleScore(seu_hum, features = list(intersect(A_h_gene, rownames(seu_hum))), name = "A_score")
+seu_hum <- AddModuleScore(seu_hum, features = list(intersect(C_h_gene, rownames(seu_hum))), name = "C_score")
+
+AC_score <- FetchData(seu_hum, vars = c("group", "A_score1", "C_score1"))
+
+## 3. visualization
+ggplot(data = AC_score, aes(x = A_score1, y = C_score1)) + 
+  stat_density2d(geom ="polygon",aes(fill = ..level..), bins=20, contour_var = "ndensity")+
+  scale_fill_viridis_c(option = "inferno", direction = -1)+
+  theme(panel.background=element_rect(fill="white",colour="black"))+ 
+  facet_wrap(~group, ncol = 3) + 
+  geom_vline(xintercept = 0)+
+  geom_hline(yintercept = 0)
+```

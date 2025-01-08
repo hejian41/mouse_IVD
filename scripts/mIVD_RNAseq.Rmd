@@ -1,0 +1,546 @@
+---
+title: "mIVD_RNAseq"
+author: "Jian"
+date: '2024-06-15'
+output: html_document
+---
+
+# Note: This script include the code used for analyzing bulk RNAseq of mouse discs
+# The input data are accessible at https://data.mendeley.com/datasets/9fxgx59jd7/1
+# For the disc groups, "F" represents type C and "H" represents type A
+
+# 1. Preparations
+## 1.1 prepare the envs and path
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=T, warning=T, cache = FALSE, cache.lazy = FALSE, dev = "png",dpi = 300)
+Sys.setenv(LANGUAGE = "en") 
+options(stringsAsFactors = F, future.fork.enable = TRUE, future.globals.maxSize = 2000 * 1024^1024, 
+        repos = c(CRAN="https://mirrors.tuna.tsinghua.edu.cn/CRAN/"),
+        BioC_mirror="https://mirrors.tuna.tsinghua.edu.cn/bioconductor/")
+```
+
+
+## 1.2 clean the envs and set the data path
+```{r}
+rm(list = ls())
+gc()
+knitr::opts_knit$set(root.dir = "~/project/mouse_IVD/RNAseq")
+```
+
+
+# 2. RNA-seq
+## 2.1 prepare data
+```{r, fig.height=15, fig.width=15}
+# load and clean the expression matrix
+exprs_gene <- readxl::read_xlsx("~/project/RNAseq/exprs_mIVD.xlsx", sheet = 1)
+exprs_gene <- na.omit(exprs_gene) # remove the NA values
+exprs_gene <- exprs_gene[!duplicated(exprs_gene$`Gene Symbol`), ] #  retain the first gene row
+exprs_gene$`Gene Symbol` <- gsub("[']", "", exprs_gene$`Gene Symbol`)
+exprs_gene <- as.data.frame(exprs_gene)
+rownames(exprs_gene) <- exprs_gene$`Gene Symbol` 
+
+# usually tpm/fpkm matrix are used for comparison of gene expression, count matrix is used for PCA and DEG analysis
+exprs_tpm <- exprs_gene[, c(7:18)]
+exprs_fpkm <- exprs_gene[, c(19:30)]
+exprs_count <- exprs_gene[, c(31:42)]
+
+# extract the sample information and rename the colnames of matrix
+meta <- reshape2::colsplit(colnames(exprs_fpkm), " ", c(1,2))
+meta <- reshape2::colsplit(meta$`1`, "_", c("sample", "specie", "age"))
+meta$group <- substr(meta$sample, 1, 1)
+meta$rep <- substr(meta$sample, 2, 3)
+rownames(meta) <- meta$sample
+colnames(exprs_fpkm) <- colnames(exprs_tpm) <- colnames(exprs_count) <- rownames(meta) 
+```  
+
+
+## 2.2 visulize gene expression
+```{r}
+# 1. prepare the curated gene list
+genes <- c("Mmp1a","Mmp9","Mmp13","Adamts4","Adamts5", # ECM homeostasis 
+           "Tnf", "Il1a",          # Inflammation
+           "Vdr", "Pik3ca","Pik3cb", "Akt1", "Akt2", "Akt3", "Mtor",# autophagy
+           "Map1lc3a","Map1lc3b","Becn1", # autophagy
+           "Bax", "Casp3", "Bcl2", # apoptosis
+           "Nox1","Duox1","Duox2","Duoxa1","Duoxa2","Cox5a","Cox5b","Sod1","Sod2",# Oxidative stress 
+           "Piezo1","Piezo2", "Trpv1", "Trpv4", "Yap1", "Rock1", "Rock2")
+genes%in% rownames(exprs_tpm)
+data_gene1 <- exprs_tpm[genes,]
+
+data_gene <- log2(data_gene1+1)
+data_gene <- as.data.frame(t(data_gene))
+data_gene$group <- meta$group
+data_gene <- reshape2::melt(data_gene, id = "group")
+data_gene$group <- factor(data_gene$group, levels = c("H","F"))
+
+
+# 2. choose the test method
+## Note: we firstly test if the distribution of data for each gene is normal distribution
+## if yes, the significance is computed using t.test; otherwise, the wilcox.test is used.
+
+test_df <- data.frame(row.names = "gene", pval_norm_H = 0.05, pval_norm_F = 0.05, pval_var = 0.05)
+for (i in genes) {
+ norm_H <- with(subset(data_gene, variable == i), shapiro.test(value[group == "H"]))
+ norm_F <- with(subset(data_gene, variable == i), shapiro.test(value[group == "F"]))
+ res.ftest <- var.test(value ~ group, data = subset(data_gene, variable == i))
+ test_tmp <- data.frame(row.names = i, pval_norm_H = norm_H$p.value,  pval_norm_F = norm_F$p.value, 
+                        pval_var = res.ftest$p.value)
+ test_df <- rbind(test_df, test_tmp)
+}
+
+# 3. visualization using ggplot2
+theme_set(cowplot::theme_cowplot())
+library(ggpubr)
+p.list <- list()
+for (gene in genes) {
+  if (test_df[gene, ]$sig == FALSE) {
+    p.list[[gene]] <- ggboxplot(subset(data_gene, variable == gene), x = "group", y = "value", fill = "group",
+              palette = c('#a5dff9','#FFBC42'), add = "point", add.params = list(size=2, shape= 21)) + 
+      labs( y = paste0("Log2(TPM+1) of ", gene), x = "")+
+      theme(legend.position = "none") + 
+      scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+      stat_compare_means(comparisons = list(c("H","F")), method = "t.test", label = "p.format")
+  } else {
+    p.list[[gene]] <- ggboxplot(subset(data_gene, variable == gene), x = "group", y = "value", fill = "group",
+              palette = c('#a5dff9','#FFBC42'), add = "point", add.params = list(size=2, shape= 5)) + 
+      labs( y = paste0("Log2(TPM+1) of ", gene), x = "")+
+      theme(legend.position = "none") + 
+      scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+      stat_compare_means(comparisons = list(c("H","F")), method = "wilcox.test", label = "p.format")
+  }
+}
+
+library(gridExtra)
+library(ggplotify)
+p_genelist <- do.call("grid.arrange", c(p.list, ncol = 10))
+p_genelist <- as.ggplot(p_genelist)
+p_genelist
+```
+
+
+## 2.3 hclust and PCA analysis
+```{r, fig.width=10, fig.height=8}
+library(ggplot2)
+theme_set(cowplot::theme_cowplot())
+
+# 1. compare sequencing depth for each sample
+data <- data.frame(expression=c(as.matrix(exprs_tpm)),sample=rep(colnames(exprs_tpm),each=nrow(exprs_tpm)))
+head(data)
+p <- ggplot(data = data,aes(x=sample,y=log2(expression+1),fill=sample))
+p1 <- p + geom_boxplot()+ 
+  theme(axis.text.x = element_text(angle = 90))+ 
+  scale_x_discrete(limits = rev(unique(data$sample)))+
+  scale_fill_manual(values = c(rep('#FFBC42',6), rep('#a5dff9',6)))+
+  xlab(NULL) + ylab("log2(TPM+1)")
+p1
+
+
+
+# 2. PCA analysis using DEseq2
+library(DESeq2)
+meta$group <- factor(meta$group, levels = c("H", "F"))
+
+exprs_count_int <- floor(exprs_count) # Integering the count values
+dds <- DESeqDataSetFromMatrix(countData = exprs_count_int, colData = meta, design = ~ group)
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep, ] 
+dim(dds)
+
+## 2.1 normalization
+library(factoextra)
+rld <- vst(dds, blind = T) 
+
+
+## 2.2 hclust of samples
+sampleDists <- dist(t(assay(rld))) # distances are calculated based on the all gene expression
+res1 <- hcut(sampleDists, k = 2, stand = FALSE,hc_method ="average") 
+p2 <- fviz_dend(res1,
+          rect_fill = T,
+          cex = 1,
+          color_labels_by_k=T,
+          horiz=T) + scale_color_manual(values = c('#FFBC42','#a5dff9'))
+p2
+
+
+## 2.3 PCA visualization 
+library(ggplot2)
+rld <- vst(dds, blind = F) 
+p3 <- plotPCA(rld, intgroup=c('group'))+
+  theme_bw() + scale_color_manual(values = c('#a5dff9','#FFBC42'))
+
+
+(p1 / p3) | p2
+ggsave(filename = "./pdf/RNAseq_1.pdf", plot = last_plot(), width = 8, height = 10, dpi = 300)
+```
+
+## 2.4 DEseq2 analysis for DEGs
+```{r}
+library(DESeq2)
+colnames(exprs_count)
+
+# 1. prepare the coldata
+coldata <- data.frame(group = factor(rep(c('F', 'H'), each = 6), levels = c('H', 'F')))
+exprs_count <- floor(exprs_count)
+
+# 2. calculate the DEGs
+dds <- DESeqDataSetFromMatrix(countData = exprs_count, colData = coldata, design= ~group)
+dds1 <- DESeq(dds, fitType = 'mean', minReplicatesForReplace = 7, parallel = FALSE)
+res <- results(dds1, contrast = c('group', 'F', 'H'))
+
+res1 <- data.frame(res, stringsAsFactors = FALSE, check.names = FALSE)
+res1$gene <- rownames(res1)
+res1 <- res1[order(res1$padj, res1$log2FoldChange, decreasing = c(FALSE, TRUE)), ]
+
+# 3. filter the DEGs with foldchanges between groups greater than 1 and adjusted p values less than 0.01
+## "up" means genes highly expressed in group F, "down" means genes highly express in group H 
+res1[which(res1$log2FoldChange >= 1 & res1$padj < 0.01),'sig'] <- 'up'
+res1[which(res1$log2FoldChange <= -1 & res1$padj < 0.01),'sig'] <- 'down'
+res1[which(abs(res1$log2FoldChange) <= 1 | res1$padj >= 0.01),'sig'] <- 'none'
+
+res1_select <- subset(res1, sig %in% c('up', 'down'))
+table(res1_select$sig)
+write.csv(res1_select, file = "./RNAseq/DEGs_sig.csv")
+res1_select <- read.csv("./RNAseq/DEGs_sig.csv", row.names = 1)
+```
+
+## 2.5 Enrichment analysis
+### 2.5.1 Gene ontology
+```{r, fig.width=20, fig.height=6}
+# Note: The top 200 DEGs are used for enrichment analysis
+# Terms with p value less than 0.01 and q values less than 0.1 are thought to be significant and retained
+
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(aplot)
+
+# 1. terms enriched in DEGs specific to group H 
+enrich_down <-  enrichGO(gene          = subset(res1_select, sig == "down")$gene[1:200],
+                         OrgDb         = org.Mm.eg.db,
+                         keyType       = 'SYMBOL',
+                         ont           = "BP",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff  = 0.01,
+                         qvalueCutoff  = 0.1)
+View(enrich_down@result)
+enrich_down_filtered <- enrich_down
+
+## Note: Enriched terms engaged in other systems are excluded
+exclude <- grep("muscle|myocyte|blood|cardiac|heart|leukocyte|memory|lymphocyte|T cell", enrich_down_filtered@result$Description)
+enrich_down_filtered@result <- enrich_down_filtered@result[-exclude, ]
+
+enrich_down1 <- pairwise_termsim(enrich_down_filtered)
+p1 <- treeplot(enrich_down1, showCategory = 30)
+p1
+
+# 2. terms enriched in DEGs specific to group F 
+enrich_up <-    enrichGO(gene          = subset(res1_select, sig == "up")$gene[1:200],
+                         OrgDb         = org.Mm.eg.db,
+                         keyType       = 'SYMBOL',
+                         ont           = "BP",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff  = 0.01,
+                         qvalueCutoff  = 0.1)
+View(enrich_up@result)
+enrich_up_filtered <- enrich_up
+exclude <- grep("muscle|myocyte|blood|cardiac|heart|leukocyte|memory|lymphocyte|T|B|immune", enrich_up_filtered@result$Description)
+enrich_up_filtered@result <- enrich_up_filtered@result[-exclude, ]
+
+enrich_up1 <- pairwise_termsim(enrich_up_filtered)
+p2 <- treeplot(enrich_up1, showCategory = 30)
+p2
+
+library(cowplot)
+library(patchwork)
+p1 | p2 
+```
+
+### 2.5.2 Matrisome evaluation
+```{r, fig.height=5, fig.width=10}
+# 1. prepare the geneset
+## The gmt file is downloaded from MsigDB: https://docs.gsea-msigdb.org/#MSigDB/Release_Notes/MSigDB_2023.1.Mm/
+C2_gmt <- read.gmt("./dataset/gmt_files/mouse/m2.all.v2023.1.Mm.symbols.gmt")
+
+## alternative 1: extract the geneset from gmt files
+Oxid_genes <- subset(C2_gmt, term == "WP_OXIDATIVE_PHOSPHORYLATION")
+Glyco_genes <- subset(C2_gmt, term == "WP_GLYCOLYSIS_AND_GLUCONEOGENESIS")
+Adhen_genes <- subset(C2_gmt, term == "WP_FOCAL_ADHESION")
+
+## alternative 2: extract the geneset from AnnotationDBI 
+Clock_genes <- AnnotationDbi::select(org.Mm.eg.db, keys = c("GO:0032922"), columns = c("SYMBOL"), keytype = "GO")
+Clock_genes$term <- "Circadian_regulation"
+Clock_genes$gene <- Clock_genes$SYMBOL
+
+Osssi_genes <- AnnotationDbi::select(org.Mm.eg.db, keys = c("GO:0001503"), columns = c("SYMBOL"), keytype = "GO")
+Osssi_genes$term <- "Ossification"
+Osssi_genes$gene <- Osssi_genes$SYMBOL
+
+Chond_genes <- AnnotationDbi::select(org.Mm.eg.db, keys = c("GO:0002062"), columns = c("SYMBOL"), keytype = "GO")
+Chond_genes$term <- "Chondrocyte_diff"
+Chond_genes$gene <- Chond_genes$SYMBOL
+
+# merge the geneset
+gmt_total <- rbind(Oxid_genes, Glyco_genes,Adhen_genes,Clock_genes[, c("term", "gene")],
+                   Osssi_genes[, c("term", "gene")],Chond_genes[, c("term", "gene")])
+
+
+# 2. Run GSVA
+terms <- unique(as.character(gmt_total$term))
+gsva_score <- data.frame()
+library(GSVA)
+
+for (i in terms) {
+ gsva_s <- gsva(as.matrix(exprs_gsva), subset(gmt_total, term == i), method="gsva", parallel.sz = 10, verbose = TRUE)
+ rownames(gsva_s) <- i
+ gsva_score <- rbind(gsva_score, gsva_s)
+}
+
+gsva_score_t <- as.data.frame(t(gsva_score[, ]))
+gsva_score_t$group <- annot_gsve$group
+
+## 2.1 visualizing the average scores of geneset for each group
+gg_radar <- aggregate(gsva_score_t[,1:6], list(gsva_score_t[,7]), mean)
+rownames(gg_radar) <- gg_radar$Group.1; gg_radar <- gg_radar[, -1]
+gg_radar <- apply(gg_radar, 1, function(x){(x - min(x))/ (max(x) - min(x))})
+gg_radar <- t(gg_radar)
+gg_radar <- gg_radar %>% as_tibble(rownames = "group")# %>% mutate_at(vars(-group), rescale)
+gg_radar <- gg_radar[c(2,1), ]
+
+library(ggradar)
+ggradar(gg_radar,  group.colours = rev(c('#a5dff9', '#FFBC42')))
+```
+
+
+## 2.6 WGCNA
+### 2.6.1 prepare data
+```{r}
+## Note: WGCNA is performed according to the official manual: https://labs.genetics.ucla.edu/horvath/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/
+
+library(WGCNA)
+
+## prepare the multi-threads computation
+enableWGCNAThreads(nThreads = 10)
+
+## log2- transformed tpm matrix is used for WGCNA as suggested
+exprMat <- log2(exprs_tpm + 1)
+
+## 1. set the parameters
+type = "unsigned"
+corType = "pearson"
+corFnc = ifelse(corType=="pearson", cor, bicor)
+maxPOutliers = ifelse(corType=="pearson",1,0.05)
+robustY = ifelse(corType=="pearson",T,F)
+
+## 2. filter the genes with MAD greater than 0.01
+m.mad <- apply(exprMat,1,mad)
+dataExprVar <- exprMat[which(m.mad >max(quantile(m.mad, probs=seq(0, 1, 0.25))[2],0.01)),]
+dataExpr <- as.data.frame(t(dataExprVar))
+
+
+## 3. remove NA
+gsg = goodSamplesGenes(dataExpr, verbose = 3)
+
+if (!gsg$allOK){
+# Optionally, print the gene and sample names that were removed:
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:",
+                     paste(names(dataExpr)[!gsg$goodGenes], collapse = ",")));
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:",
+                     paste(rownames(dataExpr)[!gsg$goodSamples], collapse = ",")));
+  # Remove the offending genes and samples from the data:
+  dataExpr = dataExpr[gsg$goodSamples, gsg$goodGenes]
+  }
+
+nGenes = ncol(dataExpr)
+nSamples = nrow(dataExpr)
+
+
+## 4. test the outliar sample in each group
+sampleTree = hclust(dist(dataExpr), method = "average")
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="")
+
+powers = c(c(1:10), seq(from = 12, to=30, by=2))
+sft = pickSoftThreshold(dataExpr, powerVector=powers,
+                        networkType=type, verbose=5)
+```
+
+
+### 2.6.2 determine the power value
+```{r}
+par(mfrow = c(1,2))
+cex1 = 0.9
+
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",
+     ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red")
+# 筛选标准。R-square=0.85
+abline(h=0.85,col="red")
+
+# Soft threshold与平均连通性
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers,
+     cex=cex1, col="red")
+
+sft$powerEstimate ## 9
+```
+
+### 2.6.3 determine the blocks
+```{r}
+power = 9
+net = blockwiseModules(dataExpr, power = 9, maxBlockSize = nGenes,
+                       TOMType = type, minModuleSize = 50,
+                       reassignThreshold = 0, mergeCutHeight = 0.4,
+                       numericLabels = TRUE, pamRespectsDendro = FALSE,
+                       saveTOMs=TRUE, corType = corType,
+                       maxPOutliers=maxPOutliers, loadTOMs=TRUE,
+                       saveTOMFileBase = paste0("WGCNA.tom"),
+                       verbose = 3)
+table(net$colors)
+
+moduleLabels = net$colors
+moduleColors = labels2colors(moduleLabels)
+
+plotDendroAndColors(net$dendrograms[[1]], moduleColors[net$blockGenes[[1]]],
+                    "Module colors",dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+```
+
+### 2.6.4 visualizing the modules
+```{r, fig.height=6, fig.width=3.5}
+library(stringr)
+MEs = net$MEs
+MEs_col = MEs
+colnames(MEs_col) = paste0("ME", 
+                           labels2colors(as.numeric(str_replace_all(colnames(MEs),"ME",""))))
+MEs_col = orderMEs(MEs_col)
+
+plotEigengeneNetworks(MEs_col, "Eigengene adjacency heatmap",
+                      marDendro = c(3,3,2,4),
+                      marHeatmap = c(3,4,2,2), plotDendrograms = T,
+                      xLabelsAngle = 90)
+
+```
+
+
+### 2.6.5 calculate the modules correlated to traits (group)
+```{r}
+trait <- data.frame(row.names = rownames(dataExpr), group = c(rep(1,6), rep(0,6)))
+
+### cor traits with ME
+if (corType == "pearson") {
+  modTraitCor = cor(MEs_col, trait, use = "p")
+  modTraitP = corPvalueStudent(modTraitCor, nSamples)} else {
+    modTraitCorP = bicorAndPvalue(MEs_col, trait, robustY = robustY)
+    modTraitCor = modTraitCorP$bicor
+    modTraitP = modTraitCorP$p
+    }
+
+
+### cor genes with ME
+if (corType=="pearson") {
+  geneModuleMembership = as.data.frame(cor(dataExpr, MEs_col, use = "p"))
+  MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))} else {
+    geneModuleMembershipA = bicorAndPvalue(dataExpr, MEs_col, robustY=robustY)
+    geneModuleMembership = geneModuleMembershipA$bicor
+    MMPvalue = geneModuleMembershipA$p
+    }
+```
+
+### 2.6.6  calculate the genes contributed to each module
+```{r}
+### cor genes with traits
+if (corType=="pearson") {
+  geneTraitCor = as.data.frame(cor(dataExpr, trait, use = "p"))
+  geneTraitP = as.data.frame(corPvalueStudent(
+    as.matrix(geneTraitCor), nSamples))} else {
+      geneTraitCorA = bicorAndPvalue(dataExpr, trait, robustY=robustY)
+      geneTraitCor = as.data.frame(geneTraitCorA$bicor)
+      geneTraitP = as.data.frame(geneTraitCorA$p)
+      }
+
+###
+ggdata_MEtraits <- as.data.frame(modTraitCor)
+ggdata_MEtraits$pvalue <- modTraitP[,1]
+ggdata_MEtraits$ME <- rownames(ggdata_MEtraits)
+ggdata_MEtraits$Membership <- ggdata_MEtraits$group
+
+theme_set(cowplot::theme_cowplot())
+p_W1 <- ggplot(ggdata_MEtraits, aes(x = reorder(ME, -log10(pvalue)), y = -log10(pvalue))) + 
+  geom_bar(aes(fill = Membership), stat = "identity") +
+  scale_fill_gradient2(low = '#a5dff9', mid = "gray70",high ='#FFBC42') + 
+  labs(x = "") + geom_hline(yintercept = -log10(0.05), col = "red", linetype="dotted")+
+  coord_flip()
+p_W1
+
+textMatrix = paste(signif(modTraitCor, 2), "\n(", signif(modTraitP, 1), ")", sep = "")
+dim(textMatrix) = dim(modTraitCor)
+labeledHeatmap(Matrix = modTraitCor, xLabels = colnames(trait),
+               yLabels = colnames(MEs_col),
+               cex.lab = 0.5,
+               ySymbols = colnames(MEs_col), colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix, setStdMargins = FALSE,
+               cex.text = 0.5, zlim = c(-1,1),
+               main = paste("Module-trait relationships"))
+
+
+colnames(geneModuleMembership)
+
+## choose the interested modules
+ggdata_MEgenesA <- geneModuleMembership[, c("MEbrown","MEgreen","MEturquoise")]
+ggdata_MEgenesB <- MMPvalue[, c("MEbrown","MEgreen","MEturquoise")]
+MEbrown_genes <- intersect(rownames(ggdata_MEgenesA[ggdata_MEgenesA$MEbrown > 0.5, ]),
+                           rownames(ggdata_MEgenesB[ggdata_MEgenesB$MEbrown < 0.05, ]))
+MEgreen_genes <- intersect(rownames(ggdata_MEgenesA[ggdata_MEgenesA$MEgreen > 0.5, ]),
+                           rownames(ggdata_MEgenesB[ggdata_MEgenesB$MEgreen < 0.05, ]))
+MEturquoise_genes <- intersect(rownames(ggdata_MEgenesA[ggdata_MEgenesA$MEturquoise > 0.5, ]),
+                           rownames(ggdata_MEgenesB[ggdata_MEgenesB$MEturquoise < 0.05, ]))
+ME_gene_all <- Reduce(union, c(MEbrown_genes, MEgreen_genes, MEturquoise_genes))
+
+ggdata_MEgenesA1 <- ggdata_MEgenesA[ME_gene_all, ]
+ggdata_MEgenesB1 <- ggdata_MEgenesB[ME_gene_all, ]
+
+ggdata_MEgenesA1$gene <- rownames(ggdata_MEgenesA1)
+ggdata_MEgenesB1$gene <- rownames(ggdata_MEgenesB1)
+
+ggdata_MEgenesA1 <- reshape2::melt(ggdata_MEgenesA1, id = "gene")
+ggdata_MEgenesB1 <- reshape2::melt(ggdata_MEgenesB1, id = "gene")
+
+ggdata_MEgenes <- ggdata_MEgenesA1
+ggdata_MEgenes$tmp <- paste0(ggdata_MEgenes$gene, "_", ggdata_MEgenes$variable)
+ggdata_MEgenesB1$tmp <- paste0(ggdata_MEgenesB1$gene, "_", ggdata_MEgenesB1$variable)
+ggdata_MEgenes$pvalue <- plyr::mapvalues(ggdata_MEgenes$tmp, ggdata_MEgenesB1$tmp, ggdata_MEgenesB1$value)
+ggdata_MEgenes$pvalue <- as.numeric(ggdata_MEgenes$pvalue)
+ggdata_MEgenes <- ggdata_MEgenes[, c(1:3,5)]
+
+colnames(ggdata_MEgenes) <- c("gene", "ME", "Membership", "pvalue")
+write.csv(ggdata_MEgenes, file = "./RNAseq/WGCNA_results.csv")
+
+ggdata_MEgenes$ME <- factor(ggdata_MEgenes$ME, levels = c("MEturquoise","MEbrown","MEgreen"))
+
+## filtered genes related to disc in the modules
+gene_filetered <- c("Pax1","Cdh2", "Fgf1","Bgn","Vcan","Cd24a","Car3","Car13",
+                    "Alcam","Krt19","Krt8",
+                    "Itga1","Irf8","Cxcl14","Tcf4","Foxk1",
+                    "T","Acan","Col2a1","Fbln1", "Fbln7","Tnf", "Piezo1", "Trpv4")
+gene_filetered <- c("T", "Fgf1","Krt19","Krt8","Itga1","Cd24a","Car3","Car13", "Alcam","Acan","Cdh2",
+                    "Irf8","Cxcl14","Tnf","Tcf4","Foxk1", "Pax1","Vcan",
+                    "Fbln1", "Fbln7","Piezo1", "Trpv4","Bgn")
+ggdata_MEgenes1 <- ggdata_MEgenes[ggdata_MEgenes$gene %in% gene_filetered, ]
+
+p_W2 <- ggplot(ggdata_MEgenes1, aes(x = ME, y = gene)) + 
+  geom_point(aes(color = pvalue, size = Membership)) +
+  scale_y_discrete(limits = rev(gene_filetered)) +
+  scale_color_gradientn(colors = c("red","orange","grey70"))  +
+  scale_size_continuous(range = c(-1,4))
+
+library(patchwork)  
+(p_W1 | p_W2) + plot_layout(widths = c(2,1))
+```
+

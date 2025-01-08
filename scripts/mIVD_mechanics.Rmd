@@ -1,0 +1,828 @@
+--
+title: "mIVD_mechanics"
+author: "Jian"
+date: '2024-12-15'
+output: html_document
+---
+
+# Note: This script include the code used for analyzing mechanical test data of mouse FSU
+# The input data are accessible at https://data.mendeley.com/datasets/9fxgx59jd7/1
+
+## 1. Preparations
+### 1.1 prepare the envs and path
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=T, warning=T, cache = FALSE, cache.lazy = FALSE, dev = "png",dpi = 300)
+Sys.setenv(LANGUAGE = "en") 
+options(stringsAsFactors = F, future.fork.enable = TRUE, future.globals.maxSize = 2000 * 1024^1024, 
+        repos = c(CRAN="https://mirrors.tuna.tsinghua.edu.cn/CRAN/"),
+        BioC_mirror="https://mirrors.tuna.tsinghua.edu.cn/bioconductor/")
+```
+
+
+### 1.2 clean the envs and set the data path
+```{r}
+rm(list = ls())
+gc()
+knitr::opts_knit$set(root.dir = "~/project/mouse_IVD/mechanics")
+```
+
+
+
+## 2. ultimate compression
+### 2.1 prepare data
+```{r}
+data_fsu <- read.csv("./ultimate_compression_data.csv", row.names = 1)
+```
+
+
+### 2.2 all curve visulization
+```{r, fig.width=8, fig.height=4}
+library(ggplot2)
+data_fsu <- na.omit(data_fsu)
+p1 <- ggplot(data_fsu, aes(strain, stress, color = sample)) +
+  geom_line(aes(linetype = group))+
+  facet_wrap(~batch, scales = "free")+
+  # scale_color_brewer(palette = "Set2")+
+  theme_classic() + labs(title = "Stress-Strain curve")
+p1
+```
+
+
+### 2.3 fit Force-strain curve
+```{r, fig.width=12, fig.height=12}
+# Note: The standarized curves for each sample are retained 
+## The data after the ultimate point are removed
+## To calculate the slopes and derivates, the curves should be fitted or smoothed firstly
+
+
+# 1. smooth the curve using l-m model
+data_fsu_lm <- data.frame()
+for (s in unique(data_fsu$sample)) {
+  fsu <- subset(data_fsu, sample == s)
+  set.seed(123)
+  fit <- loess(stress ~ strain, fsu, span=0.05, degree = 1)
+  newx <- seq(0, 0.5, length.out = 1001)
+  newy <- predict(fit, newdata = data.frame(strain = newx))
+  fsu_new <- data.frame(strain = newx, stress = newy)
+  fsu_new$sample <- s
+  fsu_new$group <- unique(fsu$group)
+  data_fsu_lm <- rbind(data_fsu_lm, fsu_new) 
+}
+
+data_fsu_lm <- na.omit(data_fsu_lm)
+
+
+
+# 2. show the representative curves
+# S3_0322 type A; S3_0418 type C
+data_tmp <- subset(data_fsu_lm, sample %in% c("S3_0322","S3_0418"))
+
+p2 <- ggplot(data_tmp, aes(strain, stress, color = group))+
+  geom_line(linewidth =1)+
+  scale_color_manual(values = c('#a5dff9','#FFBC42'))+ 
+  theme_classic() + labs(title = "", y = "Stress (KPa)", x = "Strain (%)")
+p2
+
+
+#3. The data after the yield point are removed
+data_fsu_lm1 <- data.frame()
+for (s in unique(data_fsu_lm$sample)) {
+  fsu <- subset(data_fsu_lm, sample == s)
+  fsu <- fsu %>%
+  mutate(
+    slope = c(NA, diff(stress)/diff(strain)),  
+    )
+  fsu <- na.omit(fsu)
+  first_negative_index <- which(fsu$slope < 0)
+  if (isEmpty(first_negative_index)) {
+    fsu <- fsu
+  } else {
+    first_negative_index <- first_negative_index[1] - 1
+    fsu <- fsu[1:first_negative_index, ]
+  }
+  data_fsu_lm1 <- rbind(data_fsu_lm1, fsu)
+}
+
+p3 <- ggplot(data_fsu_lm1, aes(strain, stress, color = sample)) +
+  geom_line(aes(linetype = group))+
+  # facet_wrap(~sample, nrow = 3)+
+  # scale_color_brewer(palette = "Set2")+
+  theme_classic() + labs(title = "Stress-Strain curve")
+
+sample_labels <- data_fsu_lm1 %>% group_by(sample) %>%
+  filter(strain == max(strain))
+
+p3 <- p3 + 
+  geom_text_repel(data = sample_labels, 
+            aes(label = sample, x = strain, y = stress),
+            # position = position_stack(vjust = -0.5),
+            fontface = "bold", size = 1)
+p3
+```
+
+
+### 2.4 calculate yield, transition points and modules
+```{r}
+# After smoothing/fitting, the features for each sample curves can be calculated using segmented function 
+library(segmented)
+
+## 1. prepare each parameters
+samples <- c()
+yield_strain <- c()
+yield_stress <- c()
+trans_strain <- c()
+Rsq_adj_val <- c()
+module_toe <- c()
+module_linear <- c()
+
+for (s in unique(data_fsu_lm1$sample)) {
+ fsu <- subset(data_fsu_lm1, sample == s) 
+ yield_point <- fsu[which(fsu$stress == max(fsu$stress)),]$strain[1] # the yield point is the value of the maximum stress
+ yield_force <- max(fsu$stress) # the maxium force
+ fsu_linear <- fsu[fsu$strain < yield_point, ] # the endpoint of the toe and linear region
+ 
+ ## 1. segment the curve into toe and linear region
+ fsu_lm <- lm(stress~strain, data = fsu_linear)
+ 
+ ## 2. find the transition point
+ fsu_seg <- segmented(fsu_lm, seg.Z = ~strain, npsi = 1)
+ trans_point <- fsu_seg$psi[2]
+ Rsq_adj <- summary(fsu_seg)[["adj.r.squared"]] # test if it is significant
+ 
+ ## 3. split the curve
+ ### 3.1 toe region
+ model_toe <- lm(stress~strain, data = fsu_linear[fsu_linear$strain < trans_point, ])
+ slope_toe <- coef(model_toe)["strain"] ## module of toe region
+ ### 3.2 linear region
+ model_linear <- lm(stress~strain, data = fsu_linear[fsu_linear$strain > trans_point, ])
+ slope_linear <- coef(model_linear)["strain"] ## module of linear region
+ 
+ 
+ ## 4. combine the data
+ samples <- c(samples, s)
+ yield_strain <- c(yield_strain, yield_point)
+ yield_stress <- c(yield_stress, yield_force)
+ trans_strain <- c(trans_strain, trans_point)
+ Rsq_adj_val <- c(Rsq_adj_val, Rsq_adj)
+ module_toe <- c(module_toe, slope_toe)
+ module_linear <- c(module_linear, slope_linear)
+}
+
+
+fsu_results <- data.frame(samples, yield_strain,yield_stress, trans_strain, Rsq_adj_val, module_toe, module_linear)
+```
+
+
+
+### 2.5 compare the differences
+```{r, fig.height=3, fig.width=10}
+library(ggpubr)
+
+# 1. add the group information
+fsu_results$group <-  plyr::mapvalues(fsu_results$sample, data_fsu_lm1$sample, data_fsu_lm1$group)
+
+fsu_df <- reshape2::melt(fsu_results, id = c("samples", "group"))
+fsu_df$group <- factor(fsu_df$group, levels = c("A", "C"))
+table(fsu_results$group)
+
+# 2. strain
+p_fsu1 <- ggplot(subset(fsu_df, variable %in% c("trans_strain","yield_strain")), aes(group, value, fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "wilcox",
+                     comparisons = list(c("A", "C")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  scale_fill_manual(values = c('#a5dff9','#FFBC42')) +
+  facet_wrap(~variable, nrow = 1)
+p_fsu1
+
+# 3. module 
+p_fsu2 <- ggplot(subset(fsu_df, variable %in% c("module_toe","module_linear")), aes(group, value, fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "wilcox",
+                     comparisons = list(c("A", "C")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  scale_fill_manual(values = c('#a5dff9','#FFBC42')) +
+  facet_wrap(~variable, nrow = 1)
+p_fsu2
+
+# 4. maximum stress
+p_fsu3 <- ggplot(subset(fsu_df, variable %in% c("yield_stress")), aes(group, value, fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "wilcox",
+                     comparisons = list(c("A", "C")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  scale_fill_manual(values = c('#a5dff9','#FFBC42')) +
+  facet_wrap(~variable, nrow = 1)
+p_fsu3
+
+  
+(p_fsu1 | p_fsu2 | p_fsu3) + plot_layout(widths = c(1,1,0.5))
+```
+
+
+
+## 3. ultimate 3-point bending
+### 3.1 prepare data
+```{r}
+data_bend <- read.csv("./ultimate_3point_bending_data.csv", row.names = 1)
+```
+
+### 3.2 all curve visualization
+```{r, fig.width=10, fig.height=10}
+library(ggplot2)
+
+sample_labels <- data_bend %>% group_by(sample) %>%
+  filter(Displacement == max(Displacement))
+
+p1 <- ggplot(data_bend, aes(Displacement, Force, color = sample)) +
+  geom_line(aes(linetype = group))+
+  facet_wrap(~group)+
+  # scale_color_brewer(palette = "Set2")+
+  theme_classic() + labs(title = "Force-Displacement curve")
+p1 <- p1 + 
+  geom_text_repel(data = sample_labels, 
+            aes(label = sample, x = Displacement, y = Force),
+            # position = position_stack(vjust = -0.5),
+            fontface = "bold", size = 3)
+p1
+```
+
+### 3.3 fit curve
+```{r}
+
+## 1. smooth using l-m model
+data_bend_lm <- data.frame()
+
+for (s in unique(data_bend$sample)) {
+  fsu <- subset(data_bend, sample == s)
+  set.seed(123)
+  fit <- loess(Force ~ Displacement, fsu, span=0.05, degree = 1)
+  newx <- seq(0, 1.8, length.out = 1001)
+  newy <- predict(fit, newdata = data.frame(Displacement = newx))
+  fsu_new <- data.frame(Displacement = newx, Force = newy)
+  fsu_new$sample <- s
+  fsu_new$group <- unique(fsu$group)
+  data_bend_lm <- rbind(data_bend_lm, fsu_new) 
+}
+
+data_bend_lm <- na.omit(data_bend_lm)
+
+p3 <- ggplot(data_bend_lm, aes(Displacement, Force, color = sample)) +
+  geom_line(aes(linetype = group))+
+  # facet_wrap(~sample, nrow = 3)+
+  # scale_color_brewer(palette = "Set2")+
+  theme_classic() + labs(title = "Force-Displacement curve")
+
+sample_labels <- data_bend_lm %>% group_by(sample) %>%
+  filter(Displacement == max(Displacement))
+
+p3 <- p3 + 
+  geom_text_repel(data = sample_labels, 
+            aes(label = sample, x = Displacement, y = Force),
+            # position = position_stack(vjust = -0.5),
+            fontface = "bold")
+p3
+
+
+## 2. show the representative curves
+data_tmp <- subset(data_bend_lm, sample %in% c("M8_C7", "M21_C5","M18_C5"))
+
+p2 <- ggplot(data_tmp, aes(Displacement, Force, color = group))+
+  geom_line(linewidth =1)+
+  scale_color_manual(values = c('#a5dff9',"#D2CE9E",'#FFBC42'))+ 
+  theme_classic() + labs(title = "", y = "Force (N)", x = "Displacement (mm)")
+p2
+
+## 3. remove the data after the yield point
+data_bend_lm1 <- data.frame()
+for (s in unique(data_bend_lm$sample)) {
+  fsu <- subset(data_bend_lm, sample == s)
+  max_index <- which.max(fsu$Force)
+  fsu <- fsu[1:max_index, ]
+  data_bend_lm1 <- rbind(data_bend_lm1, fsu)
+}
+```
+
+### 3.4 calculate yield, transition points and modules
+```{r}
+library(segmented)
+
+samples <- c()
+yield_strain <- c()
+yield_stress <- c()
+trans_strain <- c()
+Rsq_adj_val <- c()
+module_toe <- c()
+module_linear <- c()
+
+for (s in unique(data_bend_lm1$sample)) {
+ fsu <- subset(data_bend_lm1, sample == s) 
+ yield_point <- fsu[which(fsu$Force == max(fsu$Force)),]$Displacement[1]
+ yield_force <- max(fsu$Force)
+ fsu_linear <- fsu[fsu$Displacement < yield_point, ]
+ 
+ fsu_lm <- lm(Force~Displacement, data = fsu_linear)
+ fsu_seg <- segmented(fsu_lm, seg.Z = ~Displacement, npsi = 1)
+ trans_point <- fsu_seg$psi[2]
+ Rsq_adj <- summary(fsu_seg)[["adj.r.squared"]]
+ 
+ model_toe <- lm(Force~Displacement, data = fsu_linear[fsu_linear$Displacement < trans_point, ])
+ slope_toe <- coef(model_toe)["Displacement"]
+ model_linear <- lm(Force~Displacement, data = fsu_linear[fsu_linear$Displacement > trans_point, ])
+ slope_linear <- coef(model_linear)["Displacement"]
+ 
+ samples <- c(samples, s)
+ yield_strain <- c(yield_strain, yield_point)
+ yield_stress <- c(yield_stress, yield_force)
+ trans_strain <- c(trans_strain, trans_point)
+ Rsq_adj_val <- c(Rsq_adj_val, Rsq_adj)
+ module_toe <- c(module_toe, slope_toe)
+ module_linear <- c(module_linear, slope_linear)
+}
+
+fsu_results_bending <- data.frame(samples, yield_strain,yield_stress, trans_strain, Rsq_adj_val, module_toe, module_linear)
+```
+
+
+### 3.5 compare the differences
+```{r, fig.height=3, fig.width=10}
+library(ggpubr)
+# 1. Pmax: the property to anti-bending
+data_Fmax <- data_bend %>% group_by(sample, group) %>% dplyr::summarise(max(Force))
+colnames(data_Fmax) <- c("sample", "group", "Fmax")
+data_Fmax$diameter <- plyr::mapvalues(data_Fmax$sample, data_bend$sample, data_bend$Diameter)
+data_Fmax$diameter <- as.numeric(data_Fmax$diameter)
+data_Fmax$Property <- data_Fmax$Fmax * 8 / (pi * (data_Fmax$diameter^3))
+
+p_Pmax <- ggplot(data_Fmax, aes(group, Property, fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "t.test",
+                     comparisons = list(c("AA", "AC"),c("AA", "CC"),c("AC", "CC")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  labs(y = "Bending strength (N/mm2)")+
+  scale_fill_manual(values = c('#a5dff9',"#D2CE9E",'#FFBC42'))
+
+p_Pmax
+
+# other properties
+# 1. add the group information
+fsu_results_bending$group <-  plyr::mapvalues(fsu_results_bending$sample, data_bend_lm1$sample, data_bend_lm1$group)
+fsu_results_bending$diameter <-  data_Fmax$diameter
+
+# 2. calculate the modules
+## Note: The dFSU is approximated as cylinder
+## 2.1 toe module
+fsu_results_bending$module_toe_1 <- fsu_results_bending$module_toe*8^3/(48*(pi*(fsu_results_bending$diameter)^4/64)) 
+## 2.2 linear module
+fsu_results_bending$module_linear_1 <- fsu_results_bending$module_linear*8^3/(48*(pi*(fsu_results_bending$diameter)^4/64))
+
+# 3. visualization
+fsu_df <- reshape2::melt(fsu_results_bending, id = c("samples", "group"))
+fsu_df$group <- factor(fsu_df$group, levels = c("AA","AC", "CC"))
+table(fsu_results_bending$group)
+
+# 4. strain
+p_fsu1 <- ggplot(subset(fsu_df, variable %in% c("trans_strain","yield_strain")), aes(group, value, fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "t.test",
+                     comparisons = list(c("AA", "AC"),c("AA", "CC"),c("AC", "CC")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  scale_fill_manual(values = c('#a5dff9',"#D2CE9E",'#FFBC42'))+
+  facet_wrap(~variable, nrow = 1)
+p_fsu1
+
+p_fsu2 <- ggplot(subset(fsu_df, variable %in% c("module_toe_1","module_linear_1")), aes(group, value, fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "t.test",
+                     comparisons = list(c("AA", "AC"),c("AA", "CC"),c("AC", "CC")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  scale_fill_manual(values = c('#a5dff9',"#D2CE9E",'#FFBC42'))+
+  facet_wrap(~variable, nrow = 1)
+p_fsu2
+
+
+( p_Pmax| p_fsu2 | p_fsu1 ) + plot_layout(widths = c(0.5, 1,1))
+
+```
+
+
+## 4. Axial tension-compression testing
+### 4.1 prepare data
+```{r, fig.width=15, fig.height=15}
+data_fsu <- read.csv("./cyclin_compression-tension_data.csv", row.names = 1)
+```
+
+### 4.2 split the waves
+```{r, fig.width=15, fig.height=10}
+# Note: Firstly, the cyclin curves are split into waves
+# Then, each wave is split into compression and tension process
+# The last wave is chose to compute properties for testing
+
+data_fsu_final <- data.frame()
+for (i in unique(data_fsu$sample)) {
+  data_tmp <- subset(data_fsu, sample == i)
+  data_tmp$force_ori <- data_tmp$force
+  
+  ## 1. using loess function to remove the curve noisy 
+  data_tmp$force <- loess(data_tmp$force ~ seq_along(data_tmp$force), span=0.02, degree = 1)$fitted
+  
+  ## 2. calculating the derivatives
+  wave_diff <- diff(sign(diff(data_tmp$force)))
+  
+  ## 3. determining the transition point for each wave
+  peak_indices <- which(wave_diff < 0) + 1
+  
+  ## 4. splitting waves
+  wave <- c(rep(paste0("wave_", 1), peak_indices[1]))
+  for (k in 2:length(peak_indices)) {
+    tmp <- rep(paste0("wave_", k), peak_indices[k] - peak_indices[k-1])
+    wave <- c(wave, tmp)
+    }
+  wave <- c(wave, rep(paste0("wave_", length(peak_indices) + 1), length(data_tmp$force) - peak_indices[length(peak_indices)]))
+  
+  data_tmp$wave <- wave 
+  
+  ## 4. determine the process by derivatives
+  data_tmp$wave_diff <- c(sign(diff(data_tmp$force))[1], sign(diff(data_tmp$force)))
+  data_tmp$process <- "Compression"
+  data_tmp[data_tmp$wave_diff > 0, ]$process <- "Tension"
+  
+  ## 5. filter waves with data points greater than 10
+  library(dplyr)
+  freq_table <- data_tmp %>% dplyr::count(wave)  
+  valid_values <- freq_table %>% filter(n >= 10) %>% pull(wave)
+  data_tmp <- data_tmp %>% filter(wave %in% valid_values) 
+  
+  ## 6. filter waves with incomplete compression process
+  range_table <- subset(data_tmp, process == "Compression") %>% group_by(wave) %>% 
+    dplyr::summarise(range = max(force) - min(force))  
+  valid_values <- range_table %>% filter(range >= 0.8) %>% dplyr::pull(wave)
+  data_tmp <- data_tmp %>% filter(wave %in% valid_values) 
+  
+  data_fsu_final <- rbind(data_fsu_final, data_tmp)
+}
+
+
+data_fsu_filter <- data_fsu_final
+
+## 7. choose the last complete wave for each sample
+data_fsu_filter$sample <- factor(data_fsu_filter$sample, levels = paste0("S", 1:20))
+data_fsu_filter$wave <- gsub("wave_", "", data_fsu_filter$wave)
+data_fsu_filter$wave <- as.numeric(data_fsu_filter$wave)
+data_fsu_filter$sample_wave <- paste0(data_fsu_filter$sample, "_", data_fsu_filter$wave)
+
+last_second_class_per_group <- data_fsu_filter %>%
+  group_by(sample) %>%
+  dplyr::arrange(wave) %>% 
+  dplyr::mutate(class_rank = dense_rank(wave)) %>%  
+  dplyr::filter(class_rank == length(unique(class_rank)) - 1) %>%  
+  pull(sample_wave)  
+data_fsu_filter <- subset(data_fsu_filter, sample_wave %in% as.character(last_second_class_per_group))
+
+p1 <- ggplot(data_fsu_filter, aes(x = displacement, y = force_ori, col = process)) +
+  geom_point(size = 0.5) +
+  facet_wrap(~sample, scales = "free_x") +
+  theme_bw() + labs(title = "force-displacement curve")
+p1
+```
+
+
+### 4.3 define the NZ boundry, Stiffness, ROM
+#### 4.3.1 compression
+```{r}
+NZ_length_compression <- c()
+NZ_stiff_compression <- c()
+Stiff_compression <- c()
+Axis_ROM_compression <- c()
+p_list <- list()
+
+for (s in levels(data_fsu_filter$sample)) {
+  ## 1. filter the process and sample for single curve
+  data_nz <- subset(data_fsu_filter, process == "Compression")
+  data_nz <- subset(data_nz, sample == s)
+  
+  ## 2. prepare the force-displacement data
+  data_input <- data_nz[, c("displacement", "force_ori")]
+  data_input$displacement <- data_input$displacement -  min(data_input$displacement)
+  data_input$force_ori <- data_input$force_ori -  min(data_input$force_ori)
+  rownames(data_input) <- 1:nrow(data_input)
+  
+  ## 3. double sigmoid fit
+  ### 3.1 define the function
+  double_sigmoid <- function(x, L1, k1, x01, L2, k2, x02) {
+    L1 / (1 + exp(-k1 * (x - x01))) + L2 / (1 + exp(-k2 * (x - x02)))  
+    }  
+
+  ### 3.2 data for fit
+  data_input <- data_nz[, c("displacement", "force_ori")]
+  x <- data_input$force_ori - min(data_input$force_ori)
+  y <- data_input$displacement - min(data_input$displacement)
+  
+  ## 3.3. prepare initial params  
+  start_values <- list(L1 = max(y), k1 = 100, x01 = median(x), L2 = max(y), k2 = -0.1, x02 = median(x)*2)  
+  
+  ## 3.3 do nls fitting 
+  relaxed_fit <- try(nls(y ~ double_sigmoid(x, L1, k1, x01, L2, k2, x02), 
+                         start = start_values,  algorithm = "port",   
+                         control = list(maxiter = 1000, warnOnly = TRUE),  
+                         lower = c(0, -Inf, -Inf, 0, -Inf, -Inf),   
+                         upper = c(Inf, Inf, Inf, Inf, Inf, Inf)))  
+  
+  ## 3.4. function and output
+   if (!inherits(relaxed_fit, "try-error")) {  
+     y_fit <- predict(relaxed_fit, newdata = list(x = x))
+     # plot(x, y, main="Double Sigmoid Fit", xlab="Axis Load", ylab="Deflection", pch=19)  
+     # lines(x, y_fit, col="red", lwd=2)  
+     # legend("topleft", legend=c("Data", "Fit"),    
+     #        col=c("black", "red"), lty=c(0,1), pch=c(19,NA))  
+     } else {  
+       cat("Fitting with relaxed constraints failed. Please check your data or initial guesses.\n")  
+     }
+  
+  # 4. find the inflection_points
+  library(pracma)
+  x_fit <- seq(min(x), max(x), length.out = 1000)  
+  y_fit <- predict(relaxed_fit, newdata = data.frame(x = x_fit))  
+  df <- data.frame(x = x_fit, y = y_fit)  
+  df$dy_dx <- gradient(y_fit, x_fit)  # 1st derivative
+  df$d2y_dx2 <- gradient(df$dy_dx, x_fit)  # 2nd derivative 
+
+  ## 4.1 set 2nd derivates = 0 as points  
+  inflection_1st_y <- df$y[which.max(df$d2y_dx2)]  
+  inflection_2nd_y <- df$y[which.min(df$d2y_dx2)]  
+
+  inflection_1st_x <- df$x[which.max(df$d2y_dx2)]  
+  inflection_2nd_x <- df$x[which.min(df$d2y_dx2)] 
+  
+  ## 4.2 plot
+  p_list[[s]] <- ggplot(df) + 
+    geom_point(aes(x = x, y = y), size = 0.1)+
+    geom_line(aes(x = x, y = (dy_dx)/10), col = "red") +
+    geom_line(aes(x = x, y = (d2y_dx2)/100), col = "blue") +
+    geom_hline(yintercept = inflection_1st_y,lty="dashed") + 
+    geom_hline(yintercept = inflection_2nd_y,lty="dashed") +
+    geom_vline(xintercept = inflection_1st_x,lty="dashed") + 
+    geom_vline(xintercept = inflection_2nd_x,lty="dashed") +
+    theme_bw() + 
+    labs(x = "load", y  = "displacement", title = paste0("Compression curve of ", s))
+  
+  ## 5. NC length
+  NZ_length <- inflection_2nd_y - inflection_1st_y
+  NZ_length_compression <- c(NZ_length_compression, NZ_length)
+  
+  Stiff_NZ <- (inflection_2nd_x - inflection_1st_x)/(inflection_2nd_y - inflection_1st_y)
+  NZ_stiff_compression <- c(NZ_stiff_compression, Stiff_NZ)
+  
+  ## 6. Compressive stiffness:  bottom 25%-75% of compressive curve
+  x_med <- median(x_fit)
+  x_range <- x_med - min(x_fit)
+  stiff <- 0.5*(x_med - min(x_fit)) /(predict(relaxed_fit, newdata = data.frame(x = min(x_fit) + 0.75*x_range)) - predict(relaxed_fit, newdata = data.frame(x = min(x_fit) + 0.25*x_range)))
+  Stiff_compression <- c(Stiff_compression, stiff)
+  
+  ## 7. Axis range of motion
+  y_max <- predict(relaxed_fit, newdata = data.frame(x = x_med))
+  y_min <- predict(relaxed_fit, newdata = data.frame(x = min(x_fit)))
+  Axis_ROM <- y_max - y_min
+  Axis_ROM_compression <- c(Axis_ROM_compression, Axis_ROM)
+
+}
+
+
+## integration
+data_compression <- data.frame(row.names = levels(data_fsu_filter$sample),
+                               NZ_length_compression = NZ_length_compression,
+                               Axis_ROM_compression = Axis_ROM_compression, 
+                               Stiff_compression = Stiff_compression,
+                               NZ_stiff_compression = NZ_stiff_compression)
+
+```
+
+#### 4.3.2 tension
+```{r}
+NZ_length_tensile <- c()
+NZ_stiff_tensile <- c()
+Stiff_tensile <- c()
+Axis_ROM_tensile <- c()
+p_list <- list()
+
+for (s in levels(data_fsu_filter$sample)) {
+  ## 1. filter the process and sample for single curve
+  data_nz <- subset(data_fsu_filter, process == "Tension")
+  data_nz <- subset(data_nz, sample == s)
+  
+  ## 2. prepare the force-displacement dataa 
+  data_input <- data_nz[, c("displacement", "force_ori")]
+  data_input$displacement <- data_input$displacement -  min(data_input$displacement)
+  data_input$force_ori <- data_input$force_ori -  min(data_input$force_ori)
+  rownames(data_input) <- 1:nrow(data_input)
+  
+  ## 3. double sigmoid fit
+  ### 3.1 define the function
+  double_sigmoid <- function(x, L1, k1, x01, L2, k2, x02) {
+    L1 / (1 + exp(-k1 * (x - x01))) + L2 / (1 + exp(-k2 * (x - x02)))  
+    }  
+
+  ### 3.2 data for fit
+  data_input <- data_nz[, c("displacement", "force_ori")]
+  x <- data_input$force_ori - min(data_input$force_ori)
+  y <- data_input$displacement - min(data_input$displacement)
+  
+  ## 3.3. prepare initial params  
+  start_values <- list(L1 = max(y), k1 = 100, x01 = median(x), L2 = max(y), k2 = -0.1, x02 = median(x)*2)  
+  
+  ## 3.3 do nls fitting 
+  relaxed_fit <- try(nls(y ~ double_sigmoid(x, L1, k1, x01, L2, k2, x02), 
+                         start = start_values,  algorithm = "port",   
+                         control = list(maxiter = 1000, warnOnly = TRUE),  
+                         lower = c(0, -Inf, -Inf, 0, -Inf, -Inf),   
+                         upper = c(Inf, Inf, Inf, Inf, Inf, Inf)))  
+  
+  ## 3.4. function and output
+   if (!inherits(relaxed_fit, "try-error")) {  
+     y_fit <- predict(relaxed_fit, newdata = list(x = x))
+     # plot(x, y, main="Double Sigmoid Fit", xlab="Axis Load", ylab="Deflection", pch=19)  
+     # lines(x, y_fit, col="red", lwd=2)  
+     # legend("topleft", legend=c("Data", "Fit"),    
+     #        col=c("black", "red"), lty=c(0,1), pch=c(19,NA))  
+     } else {  
+       cat("Fitting with relaxed constraints failed. Please check your data or initial guesses.\n")  
+     }
+  
+  # 4. find the inflection_points
+  library(pracma)
+  x_fit <- seq(min(x), max(x), length.out = 1000)  
+  y_fit <- predict(relaxed_fit, newdata = data.frame(x = x_fit))  
+  df <- data.frame(x = x_fit, y = y_fit)  
+  df$dy_dx <- gradient(y_fit, x_fit)  # 1st derivative
+  df$d2y_dx2 <- gradient(df$dy_dx, x_fit)  # 2nd derivative 
+
+  ## 4.1 set 2nd derivates = 0 as points  
+  inflection_1st_y <- df$y[which.max(df$d2y_dx2)]  
+  inflection_2nd_y <- df$y[which.min(df$d2y_dx2)]  
+
+  inflection_1st_x <- df$x[which.max(df$d2y_dx2)]  
+  inflection_2nd_x <- df$x[which.min(df$d2y_dx2)] 
+  
+  ## 4.2 plot
+  p_list[[s]] <- ggplot(df) + 
+    geom_point(aes(x = x, y = y), size = 0.1)+
+    geom_line(aes(x = x, y = (dy_dx)/10), col = "red") +
+    geom_line(aes(x = x, y = (d2y_dx2)/100), col = "blue") +
+    geom_hline(yintercept = inflection_1st_y,lty="dashed") + 
+    geom_hline(yintercept = inflection_2nd_y,lty="dashed") +
+    geom_vline(xintercept = inflection_1st_x,lty="dashed") + 
+    geom_vline(xintercept = inflection_2nd_x,lty="dashed") +
+    theme_bw() + 
+    labs(x = "load", y  = "displacement", title = paste0("Tensile curve of ", s))
+  
+  ## 5. NC length
+  NZ_length <- inflection_2nd_y - inflection_1st_y
+  NZ_length_tensile <- c(NZ_length_tensile, NZ_length)
+  
+  Stiff_NZ <- (inflection_2nd_x - inflection_1st_x)/(inflection_2nd_y - inflection_1st_y)
+  NZ_stiff_tensile <- c(NZ_stiff_tensile, Stiff_NZ)
+  
+  ## 6. Tensile stiffness: top 25% - 75% of tensile curve
+  x_med <- median(x_fit)
+  x_range <- max(x_fit) - x_med 
+  stiff <- 0.5*(max(x_fit)- x_med) /(predict(relaxed_fit, newdata = data.frame(x = x_med + 0.75*x_range)) - predict(relaxed_fit, newdata = data.frame(x = x_med + 0.25*x_range)))
+  Stiff_tensile<- c(Stiff_tensile, stiff)
+  
+  ## 7. Axis range of motion
+  y_max <- predict(relaxed_fit, newdata = data.frame(x = max(x_fit)))
+  y_min <- predict(relaxed_fit, newdata = data.frame(x = x_med))
+  Axis_ROM <- y_max - y_min
+  Axis_ROM_tensile <- c(Axis_ROM_tensile, Axis_ROM)
+
+}
+
+
+## integration
+data_tensile <- data.frame(row.names = levels(data_fsu_filter$sample),
+                           NZ_length_tensile= NZ_length_tensile,
+                           Axis_ROM_tensile = Axis_ROM_tensile, 
+                           Stiff_tensile = Stiff_tensile,
+                           NZ_stiff_tensile = NZ_stiff_tensile)
+
+```
+
+### 4.4 compare the differences
+```{r, fig.width=16, fig.height=3}
+data_cyclin <- cbind(data_compression, data_tensile)
+data_cyclin$disc_type = mapvalues(levels(data_fsu_filter$sample), data_fsu_filter$sample, data_fsu_filter$type)
+data_cyclin$disc_height = mapvalues(levels(data_fsu_filter$sample), data_fsu_filter$sample, data_fsu_filter$height)
+data_cyclin$disc_area = mapvalues(levels(data_fsu_filter$sample), data_fsu_filter$sample, data_fsu_filter$area)
+
+data_cyclin$disc_height <- as.numeric(data_cyclin$disc_height)
+data_cyclin$disc_area <- as.numeric(data_cyclin$disc_area)
+
+## normalization
+data_cyclin$NZ_length_compression <- data_cyclin$NZ_length_compression/data_cyclin$disc_height
+data_cyclin$Axis_ROM_compression <- data_cyclin$Axis_ROM_compression/data_cyclin$disc_height
+data_cyclin$Stiff_compression <- data_cyclin$Stiff_compression/data_cyclin$disc_area*data_cyclin$disc_height
+data_cyclin$NZ_stiff_compression <- data_cyclin$NZ_stiff_compression/data_cyclin$disc_area*data_cyclin$disc_height
+
+data_cyclin$NZ_length_tensile <- data_cyclin$NZ_length_tensile/data_cyclin$disc_height
+data_cyclin$Axis_ROM_tensile <- data_cyclin$Axis_ROM_tensile/data_cyclin$disc_height
+data_cyclin$Stiff_tensile <- data_cyclin$Stiff_tensile/data_cyclin$disc_area*data_cyclin$disc_height
+data_cyclin$NZ_stiff_tensile <- data_cyclin$NZ_stiff_tensile/data_cyclin$disc_area*data_cyclin$disc_height
+
+## visualization
+fsu_df <- reshape2::melt(data_cyclin[, 1:9],id = "disc_type")
+colnames(fsu_df) <- c("group", "variable", "value")
+fsu_df$value <- as.numeric(fsu_df$value)
+
+p_fsu1 <- ggplot(subset(fsu_df, variable %in% c("NZ_length_compression","NZ_length_tensile")), aes(group, value, fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "wilcox",
+                     comparisons = list(c("A", "C")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  scale_fill_manual(values = c('#a5dff9','#FFBC42')) +
+  facet_wrap(~variable, nrow = 1)
+p_fsu1
+
+p_fsu2 <- ggplot(subset(fsu_df, variable %in% c("Axis_ROM_compression","Axis_ROM_tensile")), aes(group, value, fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "wilcox",
+                     comparisons = list(c("A", "C")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  scale_fill_manual(values = c('#a5dff9','#FFBC42')) +
+  facet_wrap(~variable, nrow = 1)
+p_fsu2
+
+p_fsu3 <- ggplot(subset(fsu_df, variable %in% c("Stiff_compression", "Stiff_tensile")), aes(group, log2(value+1), fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "wilcox",
+                     comparisons = list(c("A", "C")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  scale_fill_manual(values = c('#a5dff9','#FFBC42')) +
+  facet_wrap(~variable, nrow = 1)
+p_fsu3
+
+
+p_fsu4 <- ggplot(subset(fsu_df, variable %in% c("NZ_stiff_compression", "NZ_stiff_tensile")), aes(group, value, fill=group))+
+  geom_bar(stat="summary",fun=mean,position="dodge", width = 0.8)+ 
+  geom_jitter(width = 0.3,size=5, pch=21, color="black", fill = "white")+
+  stat_summary(geom = "errorbar", fun.data = 'mean_se', width = 0.3)+
+  stat_compare_means(aes(x=group, y=value), method = "wilcox",
+                     comparisons = list(c("A", "C")),
+                     label = "p.format" )+
+  # stat_compare_means(label.y = 0.9)+
+  theme_classic()+
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+ 
+  scale_fill_manual(values = c('#a5dff9','#FFBC42')) +
+  facet_wrap(~variable, nrow = 1)
+p_fsu4
+
+  
+p_fsu1 | p_fsu2 | p_fsu3 | p_fsu4
+```
+
+
+
+
