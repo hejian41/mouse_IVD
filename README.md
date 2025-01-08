@@ -9,6 +9,6 @@ This repository contains codes used for analyzing the mouse disc cell atlas.
 ### 3. All precessed data, including RNA-seq of murine discs, scRNA-seq of murine and human discs, are accessible at Mendeley repository (He, Jian (2024), “Collagenesis of mouse intervertebral disc contributes to spine stability”, Mendeley Data, V1, doi: 10.17632/9fxgx59jd7.1)
 #### 3.1 The interative web browser to explore the scRNA-data: http://www.ivdatlas.cn:3838 
 
-### 4. The mechanical test data reported in the study have been uploaded in to Mendeley repository
+### 4. The data folder contains mechanical test files reported in the study
 
 #### Any question or more information, Please contact the author: Jianhe.amms@gmail.com
