@@ -5,12 +5,11 @@ This repository contains codes used for analyzing the mouse disc cell atlas.
 ### 1. The scripts contain the codes used in the analysis of transcriptome and mechanical test data
 
 ### 2. All raw fastq files have been uploaded and deposited in official repositories
-#### 2.1 Mouse P28 disc: National Omics Data Encyclopedia (NODE, https://www.biosino.org/node/index) with accession number OEP004269 and OEP005392
-#### 2.2 Human fetal disc: Genome Sequence Archive (GSA-Human, https://ngdc.cncb.ac.cn/gsa-human) with accession number HRA009055
+#### 2.1 Mouse disc at P30 and P7: National Omics Data Encyclopedia (NODE, https://www.biosino.org/node/index) with accession number OEP004269, OEP005392 and OEP00006715.
+#### 2.2 Human fetal disc: Genome Sequence Archive (GSA-Human, https://ngdc.cncb.ac.cn/gsa-human) with accession number PRJCA031557 
 
-### 3. All precessed data, including RNA-seq of murine discs, scRNA-seq of murine and human discs, are accessible at Mendeley repository (He, Jian (2024), “Collagenesis of mouse intervertebral disc contributes to spine stability”, Mendeley Data, V1, doi: 10.17632/9fxgx59jd7.1)
-#### 3.1 Temporary link: https://data.mendeley.com/preview/9fxgx59jd7?a=8bb62965-644b-424c-a935-7cbb479083ef
-#### 3.2 The interative web browser to explore the scRNA-data: http://dataset.ivdatlas.cn/scIVD
+### 3. All precessed data, including RNA-seq of murine discs, scRNA-seq of murine and human discs, are accessible at Mendeley repository (He, Jian (2026), “Collagenesis of mouse intervertebral disc contributes to spine stability”, Mendeley Data, V2, doi: 10.17632/9fxgx59jd7.2)
+#### 3.1 The interative web browser to explore the scRNA-data: http://dataset.ivdatlas.cn/scIVD
 
 ### 4. The data folder contains mechanical test files reported in the study
 
